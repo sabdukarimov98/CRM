@@ -1,0 +1,251 @@
+
+/* ============================================================================
+   ЭКРАН ТОРГОВОГО ПРЕДСТАВИТЕЛЯ — Syntex Operations Grade
+   Отвечает на единственный вопрос роли: «что мне делать прямо сейчас».
+   Построен на существующих функциях: myClients, visitedToday, distKm,
+   startVisit, visitPhoto, txSend, prod, cli. Новой бизнес-логики нет.
+   ============================================================================ */
+
+let SUGG=null;        // предзаполненный заказ {cid, items:{pid:qty}, method}
+let TILES_OPEN=false; // «все разделы» свёрнуты по умолчанию
+
+function agentMode(){
+  const m=me();if(!m)return false;
+  if(m.role==='courier'||m.role==='expediter')return false;
+  if(m.role==='supervisor'||m.role==='manager'||m.role==='admin')return false;
+  return true;
+}
+
+/* маршрут сегодняшнего дня для этого сотрудника */
+function agentRouteToday(){
+  const m=me();if(!m)return [];
+  const dow=(new Date(today()+'T12:00').getDay()+6)%7+1;
+  const rs=new Set(L('routes').filter(r=>r.dow===dow&&(!m.terr||r.terr===m.terr)
+    &&!((m.restrictRoutes||[]).includes(r.id))).map(r=>r.id));
+  let list=myClients().filter(c=>rs.has(c.route));
+  if(!list.length)list=myClients();          // маршрут не настроен — показываем всю базу
+  return list;
+}
+
+/* ближайшая непосещённая точка */
+function agentNext(){
+  let left=agentRouteToday().filter(c=>!visitedToday(c.id));
+  if(GEO)left.sort((a,b)=>(a.lat?distKm(GEO,[a.lat,a.lng]):99)-(b.lat?distKm(GEO,[b.lat,b.lng]):99));
+  return left[0]||null;
+}
+
+/* средний заказ точки по её истории — основа предзаполнения */
+function suggestOrder(cid){
+  const map={};
+  const push=items=>(items||[]).forEach(i=>{
+    if(!map[i.p])map[i.p]={q:0,n:0};map[i.p].q+=i.q;map[i.p].n++;});
+  (DATA.orders||[]).filter(o=>o.client===cid&&o.status!=='canceled').forEach(o=>push(o.items));
+  MYTX.filter(t=>t.type==='order'&&t.payload.client===cid).forEach(t=>push(t.payload.items));
+  return Object.entries(map)
+    .map(([p,v])=>({p:p,q:Math.max(1,Math.round(v.q/v.n)),n:v.n}))
+    .filter(x=>{const pr=prod(x.p);return pr&&allowedProd(pr);})
+    .sort((a,b)=>b.n-a.n||b.q-a.q)
+    .slice(0,8)
+    .map(x=>({p:x.p,q:x.q,price:prod(x.p).price}));
+}
+function suggInit(cid){
+  const items={};
+  suggestOrder(cid).forEach(i=>items[i.p]=i.q);
+  SUGG={cid:cid,items:items,method:'cash'};
+}
+function suggTotal(){
+  if(!SUGG)return 0;
+  return Object.entries(SUGG.items).reduce((s,[p,q])=>s+q*((prod(p)||{}).price||0),0);
+}
+function suggStep(pid,d){
+  if(!SUGG)return;
+  const q=Math.max(0,(SUGG.items[pid]||0)+d);
+  if(q)SUGG.items[pid]=q;else delete SUGG.items[pid];
+  render();
+}
+function suggMethod(m){if(SUGG){SUGG.method=m;render();}}
+
+function suggSend(){
+  if(!SUGG)return;
+  const cid=SUGG.cid;
+  const items=Object.entries(SUGG.items).map(([p,q])=>({p:p,q:q,price:(prod(p)||{}).price||0}));
+  if(!items.length){toast('Добавьте хотя бы одну позицию');return;}
+  const total=items.reduce((s,i)=>s+i.q*i.price,0);
+  const c=cli(cid)||{};
+  const p={id:uid('o'),number:'MB-'+Date.now().toString().slice(-6),client:cid,agent:me().id,
+    terr:c.terr||'',route:c.route||'',date:today(),createdAt:now(),status:'new',
+    method:SUGG.method,payType:'onsite',consignTerm:null,consignNote:'',
+    items:items,total:total,paid:0,deliveryMethod:'delivery',source:'mobile'};
+  txSend('order',p);
+  if(VISIT&&VISIT.client===cid)VISIT.actions.push('order');
+  SUGG=null;
+  toast('Заказ отправлен · '+money(total));
+  render();
+}
+
+/* ---------------------------------------------------------------------------
+   Рендер
+   --------------------------------------------------------------------------- */
+function vAgentHome(){
+  const t=today();
+  const all=agentRouteToday();
+  const doneList=all.filter(c=>visitedToday(c.id));
+  const done=doneList.length,total=all.length;
+  const ords=myOrders(t);
+  const sum=ords.reduce((s,o)=>s+(o.payload.total||0),0);
+  const next=VISIT?cli(VISIT.client):agentNext();
+  const pos=Math.min(done+1,total);
+
+  $('#page').innerHTML=
+    agentBanners()
+    +(next?agentFocus(next,pos,total):agentDone(done,total))
+    +agentDayStrip(done,total,ords.length,sum)
+    +agentSections();
+  if(VISIT){clearInterval(VTIMER);VTIMER=setInterval(tickVisit,1000);tickVisit();}
+}
+
+/* предупреждения о разрешениях — компактно, без блокировки работы */
+function agentBanners(){
+  let h='';
+  if(GEO_DENIED&&!GPS_HIDE)h+=`<div class="card" style="background:var(--amber-100,#FDF1DF);border-color:var(--amber-line,#F2D7A6);display:flex;gap:10px;align-items:flex-start">
+    <span style="width:8px;height:8px;border-radius:2px;background:var(--amber);flex:0 0 auto;margin-top:5px"></span>
+    <div style="flex:1;font-size:12.5px;line-height:1.45;color:var(--ink-2)">Геолокация выключена — визиты не засчитываются.
+      <div style="margin-top:6px;display:flex;gap:14px"><b onclick="retryGeo()" style="color:var(--amber);cursor:pointer">Включить</b><b onclick="GPS_HIDE=true;render()" style="color:var(--muted);cursor:pointer">Скрыть</b></div></div></div>`;
+  if(ST.outbox.length)h+=`<div class="card" style="display:flex;gap:10px;align-items:center">
+    <span style="width:8px;height:8px;border-radius:50%;background:var(--amber);flex:0 0 auto"></span>
+    <div style="flex:1;font-size:13px">Ожидают отправки: <b class="num">${ST.outbox.length}</b></div>
+    <button class="btn sm ghost" style="width:auto" onclick="flushOutbox().then(()=>render())">Отправить</button></div>`;
+  return h;
+}
+
+/* главная карточка: следующая точка и что с ней делать */
+function agentFocus(c,pos,total){
+  const d=(GEO&&c.lat)?distKm(GEO,[c.lat,c.lng]):null;
+  const active=VISIT&&VISIT.client===c.id;
+  const dep=clientDeposit(c.id);
+  const pend=canDeliver()?pendingDelivery(c.id):[];
+
+  let badges='';
+  if(c.debt>0)badges+=`<span class="pill red">Долг ${money(c.debt)}</span>`;
+  if(dep>0)badges+=`<span class="pill green">Депозит ${money(dep)}</span>`;
+  if(d!=null)badges+=`<span class="pill gray"><span class="num">${d.toFixed(1)}</span> км</span>`;
+  if(pend.length)badges+=`<span class="pill blue">Доставка ${pend.length}</span>`;
+
+  let bodyHtml;
+  if(!active){
+    bodyHtml=`<button class="btn primary" style="margin-top:14px" onclick="startVisit('${c.id}')">Начать визит</button>
+      <button class="btn ghost" style="margin-top:8px" onclick="clientCard('${c.id}')">Открыть карточку точки</button>
+      ${total>1?`<button class="btn ghost" style="margin-top:8px;border:0;color:var(--muted)" onclick="go('routes')">Выбрать другую точку</button>`:''}`;
+  }else if(!VISIT.photo&&ruleOn('taskSequence')){
+    bodyHtml=agentSteps(1)
+      +`<label class="btn primary" style="margin-top:14px;cursor:pointer">Сделать фото полки
+        <input type="file" accept="image/*" capture="environment" style="display:none" onchange="visitPhoto(this)"></label>
+       <button class="btn ghost" style="margin-top:8px" onclick="endVisit()">Завершить без заказа</button>`;
+  }else{
+    if(!SUGG||SUGG.cid!==c.id)suggInit(c.id);
+    bodyHtml=agentSteps(2)+agentOrderDraft(c);
+  }
+
+  return `<div class="card" style="padding:0;overflow:hidden">
+    <div style="padding:14px 14px 12px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px">
+        <span style="font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)">Точка <span class="num">${pos}</span> из <span class="num">${total}</span></span>
+        ${active?`<span class="timer" id="vt" style="font-size:15px">00:00</span>`:''}
+      </div>
+      <div style="font-size:19px;font-weight:650;letter-spacing:-.02em;margin-top:6px;line-height:1.25">${esc(c.name)}</div>
+      <div class="hint" style="margin-top:3px">${esc(c.addr||route(c.route)?.name||'')}${c.landmark?' · '+esc(c.landmark):''}</div>
+      ${badges?`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">${badges}</div>`:''}
+      ${bodyHtml}
+    </div>
+  </div>`;
+}
+
+/* ход визита: три шага, текущий подсвечен */
+function agentSteps(stage){
+  const S=[['Прибытие подтверждено',0],['Фото полки',1],['Заказ',2]];
+  return `<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line)">
+    ${S.map(([label,i])=>{
+      const st=i<stage?'done':i===stage?'now':'next';
+      const bg=st==='done'?'var(--green)':st==='now'?'var(--accent)':'var(--surface-3)';
+      const fg=st==='next'?'var(--muted)':'#fff';
+      return `<div style="display:flex;gap:10px;align-items:center;padding:5px 0">
+        <span style="width:20px;height:20px;border-radius:50%;background:${bg};color:${fg};display:grid;place-items:center;font-family:var(--mono);font-size:10px;font-weight:600;flex:0 0 auto">${st==='done'?'✓':(i+1)}</span>
+        <span style="font-size:13px;color:${st==='next'?'var(--muted)':'var(--ink)'};font-weight:${st==='now'?'600':'400'}">${label}</span></div>`;
+    }).join('')}
+  </div>`;
+}
+
+/* предзаполненный заказ */
+function agentOrderDraft(c){
+  const items=Object.entries(SUGG.items);
+  const total=suggTotal();
+  const M=[['cash','Наличные'],['terminal','Терминал'],['transfer','Перевод']];
+  return `<div style="margin-top:12px;background:var(--acc-soft,#E8EDFE);border:1px solid var(--acc-line,#C3D0FB);border-radius:8px;padding:12px">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px">
+      <span style="font-size:11px;font-family:var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)">Предложено по истории точки</span>
+      <b class="num" style="font-size:15px">${money(total)}</b>
+    </div>
+    ${items.length?items.map(([pid,q])=>{
+      const p=prod(pid)||{};
+      return `<div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid var(--line)">
+        <div style="flex:1;min-width:0">
+          <div style="font-size:13px;line-height:1.3">${esc(p.name||'—')}</div>
+          <div class="hint" style="font-size:11px"><span class="num">${money(p.price||0)}</span> · остаток <span class="num">${p.stock||0}</span></div>
+        </div>
+        <button class="btn sm ghost" style="width:36px;min-height:36px;padding:0;font-size:18px" onclick="suggStep('${pid}',-1)" aria-label="Меньше">−</button>
+        <b class="num" style="min-width:26px;text-align:center;font-size:15px">${q}</b>
+        <button class="btn sm ghost" style="width:36px;min-height:36px;padding:0;font-size:18px" onclick="suggStep('${pid}',1)" aria-label="Больше">+</button>
+      </div>`;}).join('')
+      :`<div class="hint" style="padding:10px 0">У этой точки нет истории заказов — соберите заказ вручную.</div>`}
+    <div style="display:flex;gap:6px;margin-top:12px">
+      ${M.map(([v,l])=>`<button class="chip ${SUGG.method===v?'on':''}" style="flex:1;justify-content:center;padding:9px 4px;font-size:12.5px;min-height:38px" onclick="suggMethod('${v}')">${l}</button>`).join('')}
+    </div>
+  </div>
+  <button class="btn primary" style="margin-top:12px" onclick="suggSend()">Подтвердить заказ · ${money(total)}</button>
+  <div style="display:flex;gap:8px;margin-top:8px">
+    <button class="btn ghost" style="flex:1" onclick="orderFor('${c.id}')">Изменить состав</button>
+    <button class="btn ghost" style="flex:1" onclick="retFor('${c.id}')">Возврат</button>
+  </div>
+  <button class="btn ghost" style="margin-top:8px;border:0;color:var(--muted)" onclick="endVisit()">Завершить визит</button>`;
+}
+
+/* маршрут пройден */
+function agentDone(done,total){
+  return `<div class="card" style="text-align:center;padding:24px 16px">
+    <div style="width:44px;height:44px;border-radius:50%;background:var(--green-soft,#E3F4EC);color:var(--green);display:grid;place-items:center;margin:0 auto 12px;font-size:20px">✓</div>
+    <div style="font-size:17px;font-weight:640;letter-spacing:-.02em">Маршрут пройден</div>
+    <div class="hint" style="margin-top:4px">Посещено <span class="num">${done}</span> из <span class="num">${total}</span> точек</div>
+    <button class="btn ghost" style="margin-top:16px" onclick="go('clients')">Найти дополнительную точку</button>
+  </div>`;
+}
+
+/* полоса дня */
+function agentDayStrip(done,total,nOrd,sum){
+  const pct=total?Math.round(done/total*100):0;
+  return `<div class="card" style="padding:14px">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+      <span style="font-size:11px;font-family:var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)">Мой день</span>
+      <b class="num" style="font-size:13px">${pct}%</b>
+    </div>
+    <div class="bar" style="margin-bottom:12px"><i style="width:${pct}%;background:${pct>=90?'var(--green)':pct>=50?'var(--accent)':'var(--amber)'}"></i></div>
+    <div style="display:flex;gap:10px">
+      ${[['Визиты',done+' / '+total],['Заказов',nOrd],['Сумма',money(sum)]].map(([l,v])=>
+        `<div style="flex:1"><div class="hint" style="font-size:11px">${l}</div><b class="num" style="font-size:15px">${v}</b></div>`).join('')}
+    </div>
+  </div>`;
+}
+
+/* остальные разделы — свёрнуты, чтобы не спорить с главным действием */
+function agentSections(){
+  const T=[['orders','Мои заказы'],['catalog','Каталог'],['ships','Отгрузки'],['price','Прайс'],
+           ['kpi','KPI'],['map','Карта'],['history','История'],['learn','Видео'],['tools','Инструменты'],['more','Ещё']];
+  return `<div class="card" style="padding:0;overflow:hidden">
+    <div style="padding:13px 14px;display:flex;justify-content:space-between;align-items:center;cursor:pointer;min-height:48px" onclick="TILES_OPEN=!TILES_OPEN;render()">
+      <b style="font-size:13.5px">Все разделы</b>
+      <span style="color:var(--muted);font-size:18px;transition:transform .15s;display:inline-block;transform:rotate(${TILES_OPEN?'180':'0'}deg)">⌄</span>
+    </div>
+    ${TILES_OPEN?`<div style="padding:0 12px 12px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+      ${T.map(([v,l])=>`<div class="tile" style="min-height:68px;padding:12px 6px" onclick="go('${v}')"><span>${l}</span></div>`).join('')}
+    </div>`:''}
+  </div>`;
+}
